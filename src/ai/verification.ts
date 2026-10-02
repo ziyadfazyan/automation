@@ -11,7 +11,12 @@ export class VerificationAi {
   private readonly client: OpenAI | null;
 
   constructor() {
-    this.client = config.OPENAI_API_KEY ? new OpenAI({ apiKey: config.OPENAI_API_KEY }) : null;
+    this.client = config.OPENAI_API_KEY
+      ? new OpenAI({
+        apiKey: config.OPENAI_API_KEY,
+        baseURL: config.OPENAI_BASE_URL,
+      })
+      : null;
   }
 
   async verify(record: SheetRecord, document: DocumentReaderResult): Promise<VerificationResult> {
@@ -71,7 +76,7 @@ export class VerificationAi {
       return { decision: 'REVIEW', summary: 'AI returned no content.', comparisons };
     }
 
-    const parsed = JSON.parse(content) as Partial<VerificationResult>;
+    const parsed = JSON.parse(stripJsonFence(content)) as Partial<VerificationResult>;
     const decision = parsed.decision === 'MATCH' || parsed.decision === 'MISMATCH' ? parsed.decision : 'REVIEW';
 
     return {
@@ -80,6 +85,14 @@ export class VerificationAi {
       comparisons: mergeComparisonNotes(comparisons, parsed.comparisons),
     };
   }
+}
+
+function stripJsonFence(content: string): string {
+  return content
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
 }
 
 function mergeComparisonNotes(

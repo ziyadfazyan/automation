@@ -50,6 +50,7 @@ Required Website A variables:
 Required AI variables:
 
 - `OPENAI_API_KEY`
+- `OPENAI_BASE_URL` for OpenAI-compatible providers such as 9Router, OpenRouter, or xAI
 - `OPENAI_MODEL`
 
 If `OPENAI_API_KEY` is missing, the app returns `REVIEW` and requires manual handling.

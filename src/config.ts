@@ -15,6 +15,7 @@ const envSchema = z.object({
     .default('false')
     .transform((value) => value.toLowerCase() === 'true'),
   OPENAI_API_KEY: z.string().optional(),
+  OPENAI_BASE_URL: z.string().url().optional(),
   OPENAI_MODEL: z.string().default('gpt-4o-mini'),
   INVOICE_NUMBER: z.string().optional(),
 });
