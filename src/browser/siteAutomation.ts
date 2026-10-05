@@ -22,6 +22,7 @@ export class SiteAutomation {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private selectedManifestName: string | null = null;
+  private selectedSystemMotherName = '';
 
   async initialize(): Promise<void> {
     await fs.mkdir(path.dirname(config.PLAYWRIGHT_STORAGE_STATE), { recursive: true });
@@ -80,6 +81,25 @@ export class SiteAutomation {
       'READ_DOCUMENT_READER_RESULT',
       'Document Reader result extraction failed',
     );
+    const systemMotherName = this.selectedSystemMotherName;
+    const scannedMotherName = documentReaderResult.motherName?.trim() ?? '';
+    if (systemMotherName) {
+      await this.runStep(
+        () => setIdentityField(page, [/nama ibu/i, /mother/i], systemMotherName),
+        'OCR_FAILED',
+        'RESTORE_SYSTEM_MOTHER_NAME',
+        'System mother name restore failed',
+      );
+      documentReaderResult.motherName = systemMotherName;
+    }
+    documentReaderResult.systemMotherName = systemMotherName;
+    documentReaderResult.scannedMotherName = scannedMotherName;
+    documentReaderResult.rawFields = {
+      ...documentReaderResult.rawFields,
+      'Nama Ibu Kandung Sistem': systemMotherName,
+      'Nama Ibu Kandung Scan': scannedMotherName,
+      'Nama Ibu Kandung': documentReaderResult.motherName ?? '',
+    };
 
     return { documentReaderResult, ktpTempPath, invoiceUrl };
   }
@@ -246,6 +266,7 @@ export class SiteAutomation {
     const row = await this.waitForManifestRow(page, firstManifestName);
     if (row) {
       this.selectedManifestName = firstManifestName;
+      this.selectedSystemMotherName = await readManifestRowMotherName(row);
       await row.scrollIntoViewIfNeeded();
       return;
     }
@@ -410,7 +431,7 @@ export class SiteAutomation {
     await reader.waitFor({ state: 'visible', timeout: 15000 });
     await reader.click();
     await page.waitForLoadState('networkidle').catch(() => undefined);
-    await page.waitForTimeout(3000);
+    await waitForDocumentReaderFields(page, 30000);
   }
 
   private async readDocumentReaderResult(page: Page): Promise<DocumentReaderResult> {
@@ -433,10 +454,9 @@ export class SiteAutomation {
 }
 
 async function readIdentityFields(page: Page): Promise<Record<string, string>> {
-  const visibleModal = page.locator('.modal.show, .modal[style*="display: block"]').last();
-  const scope = (await visibleModal.count()) > 0 ? visibleModal : page.locator('body');
+  const scope = await getVisibleFormScope(page);
   const labelsByField: Record<string, RegExp[]> = {
-    'Nama Lengkap': [/nama.*vaksin/i, /^nama$/i, /nama lengkap/i],
+    'Nama Lengkap': [/nama.*vaksin/i, /nama ktp/i, /^nama$/i, /nama lengkap/i],
     'NIK KTP': [/no.*identitas/i, /\bnik\b/i, /id number/i],
     'Tempat Lahir': [/tempat lahir/i, /place of birth/i],
     'Tanggal Lahir': [/tanggal lahir/i, /date of birth/i],
@@ -449,20 +469,133 @@ async function readIdentityFields(page: Page): Promise<Record<string, string>> {
     const value = await readFieldByPatterns(scope, patterns);
     if (value) result[field] = value;
   }
+  result['Nama Lengkap'] ||= await readInputByPlaceholder(scope, [/nama ktp/i, /nama.*vaksin/i]);
+  result['NIK KTP'] ||= await readInputByPlaceholder(scope, [/^nik$/i]);
+  result['Tempat Lahir'] ||= await readInputByPlaceholder(scope, [/tempat lahir/i]);
+  result['Tanggal Lahir'] ||= await readInputByPlaceholder(scope, [/tanggal lahir/i]);
+  result['Alamat sesuai KTP'] ||= await readInputByPlaceholder(scope, [/^alamat$/i]);
+  result['Nama Ibu Kandung'] ||= await readInputByPlaceholder(scope, [/nama ibu/i]);
   return result;
+}
+
+async function readManifestRowMotherName(row: Locator): Promise<string> {
+  const motherTitle = row.getByText(/Nama Ibu/i).first();
+  if ((await motherTitle.count()) > 0 && (await motherTitle.isVisible().catch(() => false))) {
+    await motherTitle.click();
+    const motherInput = row.locator('input[placeholder*="Nama Ibu" i], textarea[placeholder*="Nama Ibu" i]').first();
+    const value = await motherInput.inputValue({ timeout: 3000 }).catch(() => '');
+    if (value.trim()) return value.trim();
+  }
+
+  return row.evaluate((element) => {
+    type VueLike = {
+      name?: string;
+      value?: unknown;
+      textValue?: unknown;
+      profileData?: { mothers_name?: unknown };
+      $props?: {
+        name?: string;
+        value?: unknown;
+        profileData?: { mothers_name?: unknown };
+      };
+    };
+
+    const readValue = (value: unknown): string => (typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '');
+    const candidates = Array.from(element.querySelectorAll('*')) as Array<Element & { __vue__?: VueLike }>;
+    for (const candidate of candidates) {
+      const vm = candidate.__vue__;
+      if (!vm) continue;
+
+      const name = vm.$props?.name ?? vm.name;
+      if (name === 'mothers_name') {
+        return readValue(vm.$props?.value) || readValue(vm.value) || readValue(vm.textValue);
+      }
+
+      const profileMother = vm.$props?.profileData?.mothers_name ?? vm.profileData?.mothers_name;
+      const profileMotherValue = readValue(profileMother);
+      if (profileMotherValue) return profileMotherValue;
+    }
+
+    return '';
+  }).catch(() => '');
+}
+
+async function getVisibleFormScope(page: Page): Promise<Locator> {
+  const visibleModal = page.locator('.modal.show, .modal[style*="display: block"]').last();
+  if ((await visibleModal.count()) > 0 && (await visibleModal.isVisible().catch(() => false))) {
+    return visibleModal;
+  }
+
+  return page.locator('body');
 }
 
 async function readFieldByPatterns(scope: Locator, patterns: RegExp[]): Promise<string> {
   for (const pattern of patterns) {
-    const formGroup = scope.locator('.form-group').filter({ hasText: pattern }).first();
-    if ((await formGroup.count()) > 0) {
+    const formGroups = scope.locator('.form-group').filter({ hasText: pattern });
+    const count = await formGroups.count();
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const formGroup = formGroups.nth(index);
+      if (!(await formGroup.isVisible().catch(() => false))) continue;
+
       const input = formGroup.locator('input, textarea').first();
+      if (!(await input.isVisible().catch(() => false))) continue;
+
       const value = await input.inputValue({ timeout: 1000 }).catch(() => '');
       if (value.trim()) return value.trim();
     }
   }
 
   return '';
+}
+
+async function readInputByPlaceholder(scope: Locator, patterns: RegExp[]): Promise<string> {
+  const inputs = scope.locator('input, textarea');
+  const count = await inputs.count();
+  for (const pattern of patterns) {
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const input = inputs.nth(index);
+      if (!(await input.isVisible().catch(() => false))) continue;
+
+      const placeholder = await input.getAttribute('placeholder').catch(() => '');
+      if (!placeholder || !pattern.test(placeholder)) continue;
+
+      const value = await input.inputValue({ timeout: 1000 }).catch(() => '');
+      if (value.trim()) return value.trim();
+    }
+  }
+
+  return '';
+}
+
+async function waitForDocumentReaderFields(page: Page, timeoutMs: number): Promise<void> {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const fields = await readIdentityFields(page);
+    if (fields['Nama Lengkap'] || fields['NIK KTP'] || fields['Tempat Lahir'] || fields['Alamat sesuai KTP']) {
+      return;
+    }
+    await page.waitForTimeout(750);
+  }
+}
+
+async function setIdentityField(page: Page, patterns: RegExp[], value: string): Promise<void> {
+  const scope = await getVisibleFormScope(page);
+  for (const pattern of patterns) {
+    const formGroups = scope.locator('.form-group').filter({ hasText: pattern });
+    const count = await formGroups.count();
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const formGroup = formGroups.nth(index);
+      if (!(await formGroup.isVisible().catch(() => false))) continue;
+
+      const input = formGroup.locator('input, textarea').first();
+      if ((await input.count()) === 0 || !(await input.isVisible().catch(() => false))) continue;
+
+      await input.fill(value);
+      return;
+    }
+  }
+
+  throw new Error('Could not find identity field');
 }
 
 async function storageStateIfExists(storageStatePath: string) {

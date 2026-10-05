@@ -198,10 +198,16 @@ export async function saveWebsiteAuth(): Promise<void> {
 
 function applyMotherNameFallback(record: SheetRecord, document: DocumentReaderResult): DocumentReaderResult {
   if (document.motherName?.trim()) return document;
+  if (document.systemMotherName?.trim()) {
+    return { ...document, motherName: document.systemMotherName };
+  }
+  if (document.scannedMotherName?.trim()) {
+    return { ...document, motherName: document.scannedMotherName };
+  }
   if (record.motherName.trim()) {
     return { ...document, motherName: record.motherName };
   }
-  throw new WorkflowError('Mother name missing from Document Reader and spreadsheet', 'NEEDS_REVIEW', 'MOTHER_NAME_FALLBACK');
+  throw new WorkflowError('Mother name missing from system, scan, and spreadsheet', 'NEEDS_REVIEW', 'MOTHER_NAME_FALLBACK');
 }
 
 function printVerification(
@@ -215,7 +221,6 @@ function printVerification(
     ['Place of birth', record.birthPlace, document.birthPlace ?? ''],
     ['Date of birth', record.birthDate, document.birthDate ?? ''],
     ['Address', record.ktpAddress, document.address ?? ''],
-    ['Mother', record.motherName, document.motherName ?? ''],
   ];
 
   console.log('\nVerification result');
@@ -224,6 +229,11 @@ function printVerification(
     console.log(`  Spreadsheet: ${sheet}`);
     console.log(`  Document Reader: ${doc}`);
   }
+  console.log('Mother:');
+  console.log(`  Spreadsheet: ${record.motherName}`);
+  console.log(`  System/Rails DB: ${document.systemMotherName ?? ''}`);
+  console.log(`  Scan/Document Reader: ${document.scannedMotherName ?? ''}`);
+  console.log(`  Final used: ${document.motherName ?? ''}`);
   console.log(`AI result: ${verification.decision}`);
   console.log(`AI summary: ${verification.summary}`);
   for (const comparison of verification.comparisons) {

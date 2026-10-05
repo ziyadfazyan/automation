@@ -21,6 +21,8 @@ export interface DocumentReaderResult {
   birthDate?: string;
   address?: string;
   motherName?: string;
+  systemMotherName?: string;
+  scannedMotherName?: string;
   rawFields?: Record<string, string>;
 }
 
