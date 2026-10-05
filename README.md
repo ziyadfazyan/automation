@@ -2,7 +2,7 @@
 
 Small TypeScript/Node.js automation for the internal document verification workflow.
 
-The first implementation phase processes exactly one pending Google Sheets record and stops after:
+The automation processes visible pending Google Sheets records and asks the operator to approve each record before submitting:
 
 1. Reading the main Google Sheet.
 2. Checking Google Drive for duplicate `{manifest_name} #{invoice_number}` folders.
@@ -15,11 +15,9 @@ The first implementation phase processes exactly one pending Google Sheets recor
 9. Applying the mother-name fallback rule.
 10. Running conservative AI verification.
 11. Requiring operator approval.
-12. Stopping before submit/download/Drive upload/spreadsheet updates.
+12. Submitting after approval, downloading the two required documents, uploading to Drive, verifying uploads, and updating both spreadsheets.
 
-Batch processing and final submission steps are intentionally not enabled yet.
-
-## Setup
+## Local Setup
 
 ```bash
 npm install
@@ -36,9 +34,25 @@ Required Google variables:
 - `SECOND_SPREADSHEET_ID`
 - `SECOND_SHEET_NAME`
 - `DRIVE_PARENT_FOLDER_ID`
-- `GOOGLE_APPLICATION_CREDENTIALS`
 
-The Google identity must have access to both spreadsheets and the shared Drive folder. A service account works if the sheets/folder are shared with the service account email. Application Default Credentials also work.
+Google auth uses your own Google account through Application Default Credentials. The account must have access to both spreadsheets and the Drive parent folder.
+
+Login with `gcloud`:
+
+```bash
+gcloud auth application-default login \
+  --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets
+```
+
+If Google blocks the default gcloud OAuth app for Drive/Sheets scopes, create an OAuth Client ID in Google Cloud, add your Gmail as a test user on the OAuth consent screen, download the client JSON, then run:
+
+```bash
+gcloud auth application-default login \
+  --client-id-file=/absolute/path/to/oauth-client.json \
+  --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets
+```
+
+Use OAuth user credentials for this workflow so Drive uploads use your Google account quota and folder permissions.
 
 Required Website A variables:
 
@@ -54,6 +68,105 @@ Required AI variables:
 - `OPENAI_MODEL`
 
 If `OPENAI_API_KEY` is missing, the app returns `REVIEW` and requires manual handling.
+
+## Docker Setup
+
+Use Docker when running this project on another laptop without installing Node modules, Playwright browsers, or Linux browser dependencies on that laptop.
+
+Build the image:
+
+```bash
+npm run docker:build
+```
+
+Prepare local runtime folders:
+
+```bash
+mkdir -p artifacts playwright/.auth credentials
+```
+
+Use one of these Google auth options.
+
+Option A: login on the host with `gcloud`; `npm run docker:start` mounts `${HOME}/.config/gcloud` into the container:
+
+```bash
+gcloud auth application-default login \
+  --client-id-file=/absolute/path/to/oauth-client.json \
+  --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/spreadsheets
+```
+
+Option B: copy the generated user ADC file into `credentials/` and point `.env` to it:
+
+```bash
+cp ~/.config/gcloud/application_default_credentials.json credentials/google-adc.json
+```
+
+Then set:
+
+```env
+GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/google-adc.json
+PLAYWRIGHT_STORAGE_STATE=playwright/.auth/website-a.json
+PLAYWRIGHT_HEADLESS=true
+```
+
+Run:
+
+```bash
+npm run docker:start
+```
+
+The Docker command mounts:
+
+- `./artifacts` to keep screenshots/download evidence outside the container
+- `./playwright` to reuse Website A browser session
+- `./credentials` for optional copied user ADC files
+- `${HOME}/.config/gcloud` so Docker can use host `gcloud` Application Default Credentials
+
+Do not bake `.env`, Google ADC files, KTP files, or `playwright/.auth` into the Docker image.
+
+### Move to Another Laptop
+
+On the first laptop:
+
+```bash
+docker save document-verification-automation -o document-verification-automation.tar
+```
+
+Copy these to the other laptop:
+
+- `document-verification-automation.tar`
+- `.env`
+- `credentials/google-adc.json` if you want to reuse an existing user ADC file
+- `playwright/.auth/website-a.json` if you already saved a Website A session
+
+On the other laptop:
+
+```bash
+docker load -i document-verification-automation.tar
+mkdir -p artifacts playwright/.auth credentials
+docker run --rm -it --env-file .env \
+  -v ./artifacts:/app/artifacts \
+  -v ./playwright:/app/playwright \
+  -v ./credentials:/app/credentials \
+  -v ${HOME}/.config/gcloud:/root/.config/gcloud:ro \
+  document-verification-automation
+```
+
+The other laptop still needs Docker installed, but it does not need `npm install`, `npx playwright install`, or Playwright OS dependency setup.
+
+If the other laptop has `gcloud`, you can login there instead of copying `credentials/google-adc.json`. If it does not have `gcloud`, copy the ADC JSON and keep `GOOGLE_APPLICATION_CREDENTIALS=/app/credentials/google-adc.json` in `.env`.
+
+### Website Session in Docker
+
+The easiest path is to create `playwright/.auth/website-a.json` once on a machine where the browser can open, then copy that file with the project.
+
+For Docker runs, prefer:
+
+```env
+PLAYWRIGHT_HEADLESS=true
+```
+
+Headful Docker browser sessions are possible on Linux with X11/Wayland mounts, but they are more fragile than using an existing storage state.
 
 ## Website Session
 
@@ -79,7 +192,7 @@ Then test Chromium:
 node --import tsx -e "import('@playwright/test').then(async ({ chromium }) => { const b = await chromium.launch({ headless: true }); const p = await b.newPage(); await p.goto('data:text/html,<title>ok</title>'); console.log(await p.title()); await b.close(); })"
 ```
 
-## Run One Record
+## Run Records
 
 Process the first pending record where `Status Pengajuan Rek` is empty:
 
@@ -93,7 +206,9 @@ Process one specific invoice:
 INVOICE_NUMBER=#TAB-3739 npm run single
 ```
 
-The automation does not log full NIK values. Temporary KTP files are removed at the end of the run where possible.
+When `INVOICE_NUMBER` is empty, the automation processes visible pending rows from the filtered main sheet and continues to the next visible pending record after each success. When `INVOICE_NUMBER` is set, only that invoice is processed.
+
+The automation does not log full NIK values. Temporary KTP and document files are removed at the end of each record where possible.
 
 ## Verification
 
@@ -103,9 +218,7 @@ The operator sees spreadsheet values, Document Reader values, and the AI result:
 - `REVIEW`
 - `MISMATCH`
 
-The operator must type `approve` to continue. Any other answer is treated as rejection and the form is not submitted.
-
-For this prototype, even approval stops before form submission.
+Press Enter to approve and continue, or type `reject` to stop the record as rejected.
 
 ## Error Handling
 
@@ -133,17 +246,4 @@ Statuses used by the project:
 - `GOOGLE_DRIVE_UPLOAD_FAILED`
 - `VERIFICATION_FAILED`
 
-## Next Phase
-
-After the single-record flow is confirmed against the real site DOM, add:
-
-- form submission after approval
-- Document Pengajuan Rekening download
-- signature SVG download
-- Drive folder creation with the next numeric prefix
-- upload and verification of exactly two files
-- main sheet status update to `manifest oke`
-- append to the second sheet
-- batch processing with resume safety
-
-Keep those steps behind explicit commands until the prototype has been validated.
+After approval, the automation submits the site form, downloads the two required documents, creates or reuses the Drive folder, uploads and verifies the two files, updates the main sheet, and inserts a row into the second sheet.

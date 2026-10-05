@@ -8,7 +8,9 @@
     "build": "tsc --noEmit",
     "start": "node --import tsx src/index.ts",
     "single": "node --import tsx src/index.ts single",
-    "auth:website": "node --import tsx src/index.ts auth:website"
+    "auth:website": "node --import tsx src/index.ts auth:website",
+    "docker:build": "docker build -t document-verification-automation .",
+    "docker:start": "docker run --rm -it --env-file .env -v ./artifacts:/app/artifacts -v ./playwright:/app/playwright -v ./credentials:/app/credentials -v ${HOME}/.config/gcloud:/root/.config/gcloud:ro document-verification-automation"
   },
   "dependencies": {
     "@playwright/test": "^1.49.1",

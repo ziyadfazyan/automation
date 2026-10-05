@@ -1,0 +1,13 @@
+node_modules
+npm-debug.log
+
+.env
+.env.*
+!.env.example
+
+artifacts
+playwright/.auth
+credentials
+
+.git
+.DS_Store

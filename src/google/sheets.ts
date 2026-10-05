@@ -28,27 +28,52 @@ export class SheetsClient {
   }
 
   async findPendingRecord(invoiceNumber?: string): Promise<SheetRecord | null> {
-    const response = await this.sheets.spreadsheets.values.get({
-      spreadsheetId: config.MAIN_SPREADSHEET_ID,
-      range: `${config.MAIN_SHEET_NAME}!A:ZZ`,
-    });
+    const records = await this.findPendingRecords(invoiceNumber);
+    return records[0] ?? null;
+  }
 
-    const rows = response.data.values ?? [];
-    if (rows.length < 2) return null;
+  async findPendingRecords(invoiceNumber?: string): Promise<SheetRecord[]> {
+    const rows = await this.getVisibleMainSheetRows();
+    if (rows.length < 2) return [];
 
-    const headers = rows[0].map((header) => String(header).trim());
+    const headers = rows[0].values.map((header) => String(header).trim());
     const indexes = this.getColumnIndexes(headers);
+    const records: SheetRecord[] = [];
 
-    for (let index = 1; index < rows.length; index += 1) {
-      const row = rows[index];
-      const record = this.toRecord(row, indexes, index + 1);
+    for (const visibleRow of rows.slice(1)) {
+      const record = this.toRecord(visibleRow.values, indexes, visibleRow.rowNumber);
       if (!record.invoiceNumber) continue;
       if (invoiceNumber && !sameInvoice(record.invoiceNumber, invoiceNumber)) continue;
       if (record.accountSubmissionStatus.trim()) continue;
-      return record;
+      records.push(record);
     }
 
-    return null;
+    return records;
+  }
+
+  private async getVisibleMainSheetRows(): Promise<Array<{ rowNumber: number; values: string[] }>> {
+    const response = await this.sheets.spreadsheets.get({
+      spreadsheetId: config.MAIN_SPREADSHEET_ID,
+      ranges: [`${config.MAIN_SHEET_NAME}!A:ZZ`],
+      includeGridData: true,
+      fields: 'sheets(properties(title),data(rowData(values(formattedValue)),rowMetadata(hiddenByFilter,hiddenByUser)))',
+    });
+
+    const sheet = response.data.sheets?.find((candidate) => candidate.properties?.title === config.MAIN_SHEET_NAME);
+    const grid = sheet?.data?.[0];
+    const rowData = grid?.rowData ?? [];
+    const rowMetadata = grid?.rowMetadata ?? [];
+    const visibleRows: Array<{ rowNumber: number; values: string[] }> = [];
+
+    for (let index = 0; index < rowData.length; index += 1) {
+      const metadata = rowMetadata[index];
+      if (metadata?.hiddenByFilter || metadata?.hiddenByUser) continue;
+
+      const values = rowData[index]?.values?.map((cell) => String(cell.formattedValue ?? '').trim()) ?? [];
+      visibleRows.push({ rowNumber: index + 1, values });
+    }
+
+    return visibleRows;
   }
 
   async markStatus(rowNumber: number, status: string): Promise<void> {

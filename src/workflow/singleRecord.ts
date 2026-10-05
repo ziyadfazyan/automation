@@ -17,55 +17,92 @@ export async function runSingleRecord(): Promise<void> {
   const site = new SiteAutomation();
 
   let record: SheetRecord | null = null;
-  let ktpTempPath: string | null = null;
-  let downloadedDocuments: DownloadedDocument[] = [];
+  let processedCount = 0;
+  let siteInitialized = false;
 
   try {
-    record = await sheets.findPendingRecord(config.INVOICE_NUMBER);
-    if (!record) {
-      console.log('No pending record found.');
-      return;
-    }
+    do {
+      let ktpTempPath: string | null = null;
+      let downloadedDocuments: DownloadedDocument[] = [];
 
-    console.log(`Selected invoice ${record.invoiceNumber} for ${record.firstManifestName}.`);
-    const existing = await drive.findExistingFolder(record.invoiceNumber, record.firstManifestName);
-    if (existing) {
-      console.log(`ALREADY_EXISTS: ${existing.name} (${existing.id})`);
-      return;
-    }
+      try {
+        record = await selectRecordToProcess(sheets, drive);
+        if (!record) {
+          console.log(processedCount > 0 ? 'No more pending visible records found.' : 'No pending record found.');
+          return;
+        }
 
-    await site.initialize();
-    const result = await site.processToVerification(record);
-    ktpTempPath = result.ktpTempPath;
+        console.log(`Selected invoice ${record.invoiceNumber} for ${record.firstManifestName}.`);
 
-    const documentReaderResult = applyMotherNameFallback(record, result.documentReaderResult);
-    const verification = await new VerificationAi().verify(record, documentReaderResult);
-    printVerification(record, documentReaderResult, verification);
+        if (!siteInitialized) {
+          await site.initialize();
+          siteInitialized = true;
+        }
 
-    const approved = await requestApproval();
-    if (!approved) {
-      throw new WorkflowError('Operator rejected verification result', 'REJECTED', 'HUMAN_CONFIRMATION');
-    }
+        const result = await site.processToVerification(record);
+        ktpTempPath = result.ktpTempPath;
 
-    downloadedDocuments = await site.submitVerifiedKtpAndDownloadDocuments(result.invoiceUrl, record.invoiceNumber);
-    await uploadDocumentsAndUpdateSheets({
-      drive,
-      sheets,
-      record,
-      documents: downloadedDocuments,
-    });
-    console.log(`SUCCESS: ${record.invoiceNumber} completed and spreadsheets updated.`);
+        const documentReaderResult = applyMotherNameFallback(record, result.documentReaderResult);
+        const verification = await new VerificationAi().verify(record, documentReaderResult);
+        printVerification(record, documentReaderResult, verification);
+
+        const approved = await requestApproval();
+        if (!approved) {
+          throw new WorkflowError('Operator rejected verification result', 'REJECTED', 'HUMAN_CONFIRMATION');
+        }
+
+        downloadedDocuments = await site.submitVerifiedKtpAndDownloadDocuments(result.invoiceUrl, record.invoiceNumber);
+        await uploadDocumentsAndUpdateSheets({
+          drive,
+          sheets,
+          record,
+          documents: downloadedDocuments,
+        });
+        processedCount += 1;
+        console.log(`SUCCESS: ${record.invoiceNumber} completed and spreadsheets updated.`);
+        if (!config.INVOICE_NUMBER) console.log('Looking for the next visible pending record...');
+      } finally {
+        if (ktpTempPath) {
+          await fs.rm(ktpTempPath, { force: true }).catch(() => undefined);
+        }
+        for (const document of downloadedDocuments) {
+          await fs.rm(document.path, { force: true }).catch(() => undefined);
+        }
+      }
+    } while (!config.INVOICE_NUMBER);
   } catch (error) {
     await handleFailure(error, site, record);
   } finally {
-    if (ktpTempPath) {
-      await fs.rm(ktpTempPath, { force: true }).catch(() => undefined);
-    }
-    for (const document of downloadedDocuments) {
-      await fs.rm(document.path, { force: true }).catch(() => undefined);
-    }
     await site.close().catch(() => undefined);
   }
+}
+
+async function selectRecordToProcess(sheets: SheetsClient, drive: DriveClient): Promise<SheetRecord | null> {
+  if (config.INVOICE_NUMBER) {
+    const record = await sheets.findPendingRecord(config.INVOICE_NUMBER);
+    if (!record) return null;
+
+    const existing = await drive.findExistingFolder(record.invoiceNumber, record.firstManifestName);
+    if (existing) {
+      console.log(`ALREADY_EXISTS: ${existing.name} (${existing.id})`);
+      return null;
+    }
+
+    return record;
+  }
+
+  const records = await sheets.findPendingRecords();
+  for (const record of records) {
+    const existing = await drive.findExistingFolder(record.invoiceNumber, record.firstManifestName);
+    if (existing) {
+      console.log(`ALREADY_EXISTS: ${existing.name} (${existing.id})`);
+      continue;
+    }
+
+    return record;
+  }
+
+  return null;
 }
 
 async function uploadDocumentsAndUpdateSheets({
