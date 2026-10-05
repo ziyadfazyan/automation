@@ -9,7 +9,6 @@ import { DriveClient } from '../google/drive.js';
 import { SheetsClient } from '../google/sheets.js';
 import { DocumentReaderResult, SheetRecord, VerificationResult } from '../types/record.js';
 import { WorkflowError } from '../types/status.js';
-import { maskSensitive } from '../utils/normalize.js';
 
 export async function runSingleRecord(): Promise<void> {
   const sheets = new SheetsClient();
@@ -217,7 +216,7 @@ function printVerification(
 ): void {
   const display = [
     ['Name', record.fullName || record.firstManifestName, document.name ?? ''],
-    ['NIK', maskSensitive(record.nik), maskSensitive(document.nik)],
+    ['NIK', record.nik, document.nik ?? ''],
     ['Place of birth', record.birthPlace, document.birthPlace ?? ''],
     ['Date of birth', record.birthDate, document.birthDate ?? ''],
     ['Address', record.ktpAddress, document.address ?? ''],

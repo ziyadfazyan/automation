@@ -22,6 +22,7 @@ export class SiteAutomation {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private selectedManifestName: string | null = null;
+  private selectedInvoiceNumber: string | null = null;
   private selectedSystemMotherName = '';
 
   async initialize(): Promise<void> {
@@ -56,7 +57,7 @@ export class SiteAutomation {
     const invoiceUrl = await this.openInvoice(page, record.invoiceNumber);
     await this.openTourPack(page);
     await this.openManifestTab(page);
-    await this.selectManifestCustomer(page, record.firstManifestName);
+    await this.selectManifestCustomer(page, record.firstManifestName, record.invoiceNumber);
     const ktpTempPath = await this.runStep(
       () => this.downloadKtp(page, record.invoiceNumber),
       'DOWNLOAD_FAILED',
@@ -255,7 +256,7 @@ export class SiteAutomation {
     await page.waitForTimeout(750);
   }
 
-  private async selectManifestCustomer(page: Page, firstManifestName: string): Promise<void> {
+  private async selectManifestCustomer(page: Page, firstManifestName: string, invoiceNumber: string): Promise<void> {
     const searchName = manifestSearchName(firstManifestName);
     const searchInput = page.locator('input[placeholder*="Pencarian"][placeholder*="Nama"], input[placeholder*="search"][placeholder*="name" i]').first();
 
@@ -263,9 +264,10 @@ export class SiteAutomation {
       await searchInput.fill(searchName);
     }
 
-    const row = await this.waitForManifestRow(page, firstManifestName);
+    const row = await this.waitForManifestRow(page, firstManifestName, invoiceNumber);
     if (row) {
       this.selectedManifestName = firstManifestName;
+      this.selectedInvoiceNumber = invoiceNumber;
       this.selectedSystemMotherName = await readManifestRowMotherName(row);
       await row.scrollIntoViewIfNeeded();
       return;
@@ -278,35 +280,54 @@ export class SiteAutomation {
     );
   }
 
-  private async waitForManifestRow(page: Page, firstManifestName: string): Promise<Locator | null> {
+  private async waitForManifestRow(page: Page, firstManifestName: string, invoiceNumber: string): Promise<Locator | null> {
     const deadline = Date.now() + 60_000;
     let logged = false;
     while (Date.now() < deadline) {
-      const row = await this.findManifestRow(page, firstManifestName);
+      await scrollManifestInvoiceIntoView(page, invoiceNumber);
+      const row = await this.findManifestRow(page, firstManifestName, invoiceNumber);
       if (row) return row;
       if (!logged) {
-        console.log(`Waiting for manifest search result: ${manifestSearchName(firstManifestName)}`);
+        console.log(`Waiting for manifest search result: ${invoiceNumber} ${manifestSearchName(firstManifestName)}`);
         logged = true;
       }
+      await page.mouse.wheel(0, 900).catch(() => undefined);
       await page.waitForTimeout(1000);
     }
 
     return null;
   }
 
-  private async findManifestRow(page: Page, firstManifestName: string): Promise<Locator | null> {
+  private async findManifestRow(page: Page, firstManifestName: string, invoiceNumber: string): Promise<Locator | null> {
     const normalizedTarget = normalizeNameForComparison(manifestSearchName(firstManifestName));
+    const invoiceGroup = await findManifestInvoiceGroup(page, invoiceNumber);
+    if (invoiceGroup) {
+      const rows = invoiceGroup.locator('tbody tr').filter({
+        hasText: new RegExp(escapeRegExp(manifestSearchName(firstManifestName)), 'i'),
+      });
+      const rowCount = await rows.count();
+      for (let index = 0; index < rowCount; index += 1) {
+        const row = rows.nth(index);
+        const text = await row.innerText();
+        const isVisible = await row.isVisible().catch(() => false);
+        const box = await row.boundingBox().catch(() => null);
+        if (isVisible && box && normalizeNameForComparison(text).includes(normalizedTarget)) {
+          return row;
+        }
+      }
+    }
+
     const candidates = page.locator('tbody tr').filter({
       hasText: new RegExp(escapeRegExp(manifestSearchName(firstManifestName)), 'i'),
     });
-
     const count = await candidates.count();
     for (let index = 0; index < count; index += 1) {
       const row = candidates.nth(index);
       const text = await row.innerText();
       const isVisible = await row.isVisible().catch(() => false);
       const box = await row.boundingBox().catch(() => null);
-      if (isVisible && box && normalizeNameForComparison(text).includes(normalizedTarget)) {
+      const isCurrentInvoice = await rowBelongsToInvoice(row, invoiceNumber);
+      if (isVisible && box && isCurrentInvoice && normalizeNameForComparison(text).includes(normalizedTarget)) {
         return row;
       }
     }
@@ -389,11 +410,11 @@ export class SiteAutomation {
   }
 
   private async openScanKtpEditor(page: Page): Promise<Locator> {
-    if (!this.selectedManifestName) {
+    if (!this.selectedManifestName || !this.selectedInvoiceNumber) {
       throw new WorkflowError('Manifest customer has not been selected', 'NEEDS_REVIEW', 'SELECT_MANIFEST_CUSTOMER');
     }
 
-    const row = await this.findManifestRow(page, this.selectedManifestName);
+    const row = await this.findManifestRow(page, this.selectedManifestName, this.selectedInvoiceNumber);
     if (!row) {
       throw new WorkflowError(
         `Could not find selected manifest row for ${this.selectedManifestName}`,
@@ -518,6 +539,58 @@ async function readManifestRowMotherName(row: Locator): Promise<string> {
 
     return '';
   }).catch(() => '');
+}
+
+async function rowBelongsToInvoice(row: Locator, invoiceNumber: string): Promise<boolean> {
+  const normalizedInvoice = normalizeInvoiceForSearch(invoiceNumber).toUpperCase();
+  return row.evaluate((element, targetInvoice) => {
+    const normalizeInvoice = (value: string): string => value.replace(/^#/, '').trim().toUpperCase();
+    let current: Element | null = element;
+    while (current) {
+      const headings = Array.from(current.querySelectorAll('h5'));
+      if (headings.length > 0 && current.querySelector('tbody')) {
+        return headings.some((heading) => normalizeInvoice(heading.textContent ?? '') === targetInvoice);
+      }
+      current = current.parentElement;
+    }
+    return false;
+  }, normalizedInvoice).catch(() => false);
+}
+
+async function findManifestInvoiceGroup(page: Page, invoiceNumber: string): Promise<Locator | null> {
+  const normalizedInvoice = normalizeInvoiceForSearch(invoiceNumber).toUpperCase();
+  const headings = page.locator('h5');
+  const count = await headings.count();
+  for (let index = 0; index < count; index += 1) {
+    const heading = headings.nth(index);
+    const text = normalizeInvoiceForSearch((await heading.innerText().catch(() => '')).trim()).toUpperCase();
+    if (text !== normalizedInvoice) continue;
+
+    await heading.scrollIntoViewIfNeeded().catch(() => undefined);
+    const group = heading.locator('xpath=ancestor::*[.//tbody][1]');
+    if ((await group.count()) === 0) continue;
+
+    const visibleRows = await group.locator('tbody tr:visible').count().catch(() => 0);
+    if (visibleRows === 0) {
+      const toggleButton = heading.locator('xpath=ancestor::*[contains(@class, "row")][1]').locator('button').first();
+      if ((await toggleButton.count()) > 0 && (await toggleButton.isVisible().catch(() => false))) {
+        await toggleButton.click().catch(() => undefined);
+        await page.waitForTimeout(500);
+      }
+    }
+
+    return group;
+  }
+
+  return null;
+}
+
+async function scrollManifestInvoiceIntoView(page: Page, invoiceNumber: string): Promise<void> {
+  const group = await findManifestInvoiceGroup(page, invoiceNumber);
+  if (group) return;
+
+  await page.mouse.wheel(0, 1200).catch(() => undefined);
+  await page.waitForTimeout(300);
 }
 
 async function getVisibleFormScope(page: Page): Promise<Locator> {
