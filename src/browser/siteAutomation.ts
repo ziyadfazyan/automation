@@ -18,12 +18,32 @@ export interface DownloadedDocument {
   mimeType: string;
 }
 
+interface InvoiceApiItem {
+  number?: unknown;
+  profiles?: ProfileApiItem[];
+  bookings?: Array<{ profile?: ProfileApiItem | null }>;
+}
+
+interface ProfileApiItem {
+  name?: unknown;
+  no_ktp?: unknown;
+  place_of_birth?: unknown;
+  date_of_birth?: unknown;
+  address?: unknown;
+  kelurahan?: unknown;
+  mothers_name?: unknown;
+  gender?: unknown;
+  marriage?: unknown;
+  job?: unknown;
+  education?: unknown;
+  district?: { name?: unknown } | string | null;
+}
+
 export class SiteAutomation {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
   private selectedManifestName: string | null = null;
   private selectedInvoiceNumber: string | null = null;
-  private selectedSystemMotherName = '';
 
   async initialize(): Promise<void> {
     await fs.mkdir(path.dirname(config.PLAYWRIGHT_STORAGE_STATE), { recursive: true });
@@ -58,6 +78,12 @@ export class SiteAutomation {
     await this.openTourPack(page);
     await this.openManifestTab(page);
     await this.selectManifestCustomer(page, record.firstManifestName, record.invoiceNumber);
+    const systemFields = await this.runStep(
+      () => fetchSystemFieldsFromApi(page, record),
+      'NEEDS_REVIEW',
+      'READ_SYSTEM_FORM_FIELDS',
+      'System/Rails DB field extraction failed',
+    );
     const ktpTempPath = await this.runStep(
       () => this.downloadKtp(page, record.invoiceNumber),
       'DOWNLOAD_FAILED',
@@ -82,7 +108,8 @@ export class SiteAutomation {
       'READ_DOCUMENT_READER_RESULT',
       'Document Reader result extraction failed',
     );
-    const systemMotherName = this.selectedSystemMotherName;
+    const scannedFields = { ...documentReaderResult.rawFields };
+    const systemMotherName = systemFields['Nama Ibu Kandung']?.trim() || '';
     const scannedMotherName = documentReaderResult.motherName?.trim() ?? '';
     if (systemMotherName) {
       await this.runStep(
@@ -95,6 +122,14 @@ export class SiteAutomation {
     }
     documentReaderResult.systemMotherName = systemMotherName;
     documentReaderResult.scannedMotherName = scannedMotherName;
+    documentReaderResult.systemFields = {
+      ...systemFields,
+      'Nama Ibu Kandung': systemMotherName || systemFields['Nama Ibu Kandung'] || '',
+    };
+    documentReaderResult.scannedFields = {
+      ...scannedFields,
+      'Nama Ibu Kandung': scannedMotherName,
+    };
     documentReaderResult.rawFields = {
       ...documentReaderResult.rawFields,
       'Nama Ibu Kandung Sistem': systemMotherName,
@@ -103,6 +138,71 @@ export class SiteAutomation {
     };
 
     return { documentReaderResult, ktpTempPath, invoiceUrl };
+  }
+
+  async applyIdentityCorrections(document: DocumentReaderResult, record: SheetRecord): Promise<DocumentReaderResult> {
+    const page = this.requirePage();
+    const corrected: DocumentReaderResult = {
+      ...document,
+      name: document.ktpVision?.name || record.fullName || record.firstManifestName,
+      nik: document.ktpVision?.nik || record.nik,
+      birthPlace: document.ktpVision?.birthPlace || record.birthPlace,
+      birthDate: document.ktpVision?.birthDate || record.birthDate,
+      address: document.ktpVision?.address || record.ktpAddress,
+      motherName: document.systemMotherName || document.motherName || record.motherName,
+    };
+    const current = {
+      name: document.rawFields?.['Nama Lengkap'] ?? document.name ?? '',
+      nik: document.rawFields?.['NIK KTP'] ?? document.nik ?? '',
+      birthPlace: document.rawFields?.['Tempat Lahir'] ?? document.birthPlace ?? '',
+      birthDate: document.rawFields?.['Tanggal Lahir'] ?? document.birthDate ?? '',
+      address: document.rawFields?.['Alamat sesuai KTP'] ?? document.address ?? '',
+      rtRw: document.rawFields?.['RT/RW'] ?? '',
+      kelurahan: document.rawFields?.Kelurahan ?? '',
+      kecamatan: document.rawFields?.Kecamatan ?? '',
+      motherName: document.rawFields?.['Nama Ibu Kandung'] ?? document.motherName ?? '',
+      gender: document.rawFields?.['Jenis Kelamin'] ?? '',
+      marriageStatus: document.rawFields?.['Status Pernikahan'] ?? '',
+      job: document.rawFields?.Pekerjaan ?? '',
+      education: document.rawFields?.Pendidikan ?? '',
+    };
+    const gender = normalizeGender(document.ktpVision?.gender);
+    const marriageStatus = normalizeMarriage(document.ktpVision?.marriageStatus);
+    const job = dropdownJobFromKtp(document.ktpVision?.job);
+    const education = normalizeEducation(document.ktpVision?.education);
+    const district = document.ktpVision?.kecamatan || '';
+
+    if (shouldSetText(current.name, corrected.name)) await setIdentityField(page, [/nama.*vaksin/i, /nama ktp/i, /^nama$/i], corrected.name ?? '');
+    if (shouldSetText(current.nik, corrected.nik)) await setIdentityField(page, [/\bnik\b/i, /id number/i], corrected.nik ?? '');
+    if (shouldSetText(current.birthPlace, corrected.birthPlace)) await setIdentityField(page, [/tempat lahir/i, /place of birth/i], corrected.birthPlace ?? '');
+    if (shouldSetDate(current.birthDate, corrected.birthDate)) await setVueDateField(page, [/tanggal lahir/i, /date of birth/i], corrected.birthDate ?? '');
+    if (shouldSetAddress(current.address, corrected.address)) await setIdentityField(page, [/^alamat$/i, /address/i], corrected.address ?? '');
+    if (document.ktpVision?.rtRw && shouldSetRtRw(current.rtRw, document.ktpVision.rtRw)) {
+      await setIdentityField(page, [/rt\s*\/?\s*rw/i], document.ktpVision.rtRw);
+    }
+    if (document.ktpVision?.kelurahan && shouldSetText(current.kelurahan, document.ktpVision.kelurahan)) {
+      await setIdentityField(page, [/kelurahan/i, /village/i], document.ktpVision.kelurahan);
+    }
+    if (district && shouldSetDistrict(current.kecamatan, district, document.ktpVision?.kabupatenKota ?? '')) {
+      await setSelectField(page, [/kecamatan/i, /district/i], district);
+    }
+    if (corrected.motherName && shouldSetText(current.motherName, corrected.motherName)) {
+      await setIdentityField(page, [/nama ibu/i, /mother/i], corrected.motherName);
+    }
+    if (shouldSetDropdown(current.gender, gender, normalizeGender)) await setSelectField(page, [/jenis kelamin/i, /gender/i], gender);
+    if (shouldSetDropdown(current.marriageStatus, marriageStatus, normalizeMarriage)) {
+      await setSelectField(page, [/status pernikahan/i, /status perkawinan/i, /marriage/i], marriageStatus);
+    }
+    if (shouldSetJob(current.job, job)) await setSelectField(page, [/pekerjaan/i, /job/i], job);
+    if (shouldSetDropdown(current.education, education, normalizeEducation)) await setSelectField(page, [/pendidikan/i, /graduate/i, /education/i], education);
+
+    await page.waitForTimeout(500);
+    return mergeCurrentIdentity(corrected, await readIdentityFields(page));
+  }
+
+  async readCurrentFormIdentity(): Promise<DocumentReaderResult> {
+    const page = this.requirePage();
+    return mergeCurrentIdentity({}, await readIdentityFields(page));
   }
 
   private async runStep<T>(
@@ -138,7 +238,7 @@ export class SiteAutomation {
     await this.context?.browser()?.close();
   }
 
-  async submitVerifiedKtpAndDownloadDocuments(invoiceUrl: string, invoiceNumber: string): Promise<DownloadedDocument[]> {
+  async submitVerifiedKtpAndDownloadDocuments(invoiceUrl: string, invoiceNumber: string, displayName: string): Promise<DownloadedDocument[]> {
     const page = this.requirePage();
     await this.runStep(
       () => this.submitKtpForm(page),
@@ -148,8 +248,10 @@ export class SiteAutomation {
     );
     await page.goto(invoiceUrl, { waitUntil: 'domcontentloaded' });
     await page.reload({ waitUntil: 'domcontentloaded' });
+    await page.waitForLoadState('networkidle').catch(() => undefined);
+    await page.waitForTimeout(5000);
     return this.runStep(
-      () => this.downloadRequiredDocuments(page, invoiceUrl, invoiceNumber),
+      () => this.downloadRequiredDocuments(page, invoiceUrl, invoiceNumber, displayName),
       'DOWNLOAD_FAILED',
       'DOWNLOAD_DOCUMENTS',
       'Required document download failed',
@@ -159,15 +261,9 @@ export class SiteAutomation {
   private async openInvoice(page: Page, invoiceNumber: string): Promise<string> {
     await page.goto(config.WEBSITE_INVOICES_URL, { waitUntil: 'domcontentloaded' });
     const searchValue = normalizeInvoiceForSearch(invoiceNumber);
-    await page.locator('input[placeholder="Pencarian"]').fill(searchValue);
-    await page.keyboard.press('Enter').catch(() => undefined);
-    await page.waitForLoadState('networkidle').catch(() => undefined);
+    await searchInvoice(page, searchValue);
 
-    const invoiceLink = page
-      .locator('a')
-      .filter({ hasText: searchValue })
-      .or(page.locator(`a[href*="${searchValue}"]`))
-      .first();
+    const invoiceLink = await findExactInvoiceLink(page, searchValue);
 
     await invoiceLink.waitFor({ state: 'visible', timeout: 15000 });
     const href = await invoiceLink.getAttribute('href');
@@ -191,21 +287,25 @@ export class SiteAutomation {
     await submitButton.waitFor({ state: 'visible', timeout: 15000 });
     await submitButton.click();
     await page.waitForLoadState('networkidle').catch(() => undefined);
-    await page.locator('.modal.show').waitFor({ state: 'hidden', timeout: 30000 }).catch(() => undefined);
+    await Promise.race([
+      page.getByText(/data berhasil disimpan|berhasil|data has been saved|success/i).first().waitFor({ state: 'visible', timeout: 30000 }),
+      page.locator('.modal.show').waitFor({ state: 'hidden', timeout: 30000 }),
+    ]);
     await page.waitForTimeout(1500);
   }
 
-  private async downloadRequiredDocuments(page: Page, invoiceUrl: string, invoiceNumber: string): Promise<DownloadedDocument[]> {
+  private async downloadRequiredDocuments(page: Page, invoiceUrl: string, invoiceNumber: string, displayName: string): Promise<DownloadedDocument[]> {
     await fs.mkdir('artifacts/documents', { recursive: true });
     const detailUrl = extractInvoiceSlug(invoiceUrl) ? invoiceUrl : await this.openInvoice(page, invoiceNumber);
     const invoiceSlug = extractInvoiceSlug(detailUrl);
     const safeInvoice = invoiceNumber.replace(/[^\w.-]+/g, '_');
+    const safeName = displayName.replace(/[^\w.-]+/g, '_');
 
     const pengajuanUrl = new URL(`/print/pengajuan-rekening-jamaah/${invoiceSlug}`, config.WEBSITE_BASE_URL).toString();
     const pengajuan = await this.downloadUrl(
       page,
       pengajuanUrl,
-      `Document Pengajuan Rekening ${safeInvoice}`,
+      `Document Pengajuan Rekening ${safeName} ${safeInvoice}`,
       'artifacts/documents',
     );
 
@@ -219,11 +319,25 @@ export class SiteAutomation {
     const signer = await this.downloadUrl(
       page,
       new URL(signerHref, config.WEBSITE_BASE_URL).toString(),
-      `Signature ${safeInvoice}`,
+      `Signature ${safeName} ${safeInvoice}`,
       'artifacts/documents',
     );
 
-    return [pengajuan, signer];
+    const documents = [pengajuan, signer];
+    const parafLink = page.getByRole('link', { name: /download paraf/i }).first();
+    if (await parafLink.isVisible({ timeout: 3000 }).catch(() => false)) {
+      const parafHref = await parafLink.getAttribute('href');
+      if (parafHref && !parafHref.includes('image-not-found')) {
+        documents.push(await this.downloadUrl(
+          page,
+          new URL(parafHref, config.WEBSITE_BASE_URL).toString(),
+          `Paraf ${safeName} ${safeInvoice}`,
+          'artifacts/documents',
+        ));
+      }
+    }
+
+    return documents;
   }
 
   private async downloadUrl(page: Page, url: string, baseName: string, directory: string): Promise<DownloadedDocument> {
@@ -268,7 +382,6 @@ export class SiteAutomation {
     if (row) {
       this.selectedManifestName = firstManifestName;
       this.selectedInvoiceNumber = invoiceNumber;
-      this.selectedSystemMotherName = await readManifestRowMotherName(row);
       await row.scrollIntoViewIfNeeded();
       return;
     }
@@ -391,12 +504,9 @@ export class SiteAutomation {
 
   private async setFullKtpCrop(page: Page): Promise<void> {
     await page.locator('.cropper-container').first().waitFor({ state: 'visible', timeout: 15000 });
-    await page.evaluate(() => {
-      const image = document.querySelector('.modal.show .cropper-hidden, .cropper-hidden') as HTMLImageElement | null;
-      const cropper = image && (image as HTMLImageElement & { cropper?: {
-        getCanvasData: () => { left: number; top: number; width: number; height: number };
-        setCropBoxData: (data: { left: number; top: number; width: number; height: number }) => void;
-      } }).cropper;
+    await page.evaluate(`(() => {
+      const image = document.querySelector('.modal.show .cropper-hidden, .cropper-hidden');
+      const cropper = image && image.cropper;
 
       if (!cropper) return;
       const canvas = cropper.getCanvasData();
@@ -406,7 +516,7 @@ export class SiteAutomation {
         width: canvas.width,
         height: canvas.height,
       });
-    });
+    })()`);
   }
 
   private async openScanKtpEditor(page: Page): Promise<Locator> {
@@ -482,7 +592,14 @@ async function readIdentityFields(page: Page): Promise<Record<string, string>> {
     'Tempat Lahir': [/tempat lahir/i, /place of birth/i],
     'Tanggal Lahir': [/tanggal lahir/i, /date of birth/i],
     'Alamat sesuai KTP': [/^alamat$/i, /address/i],
+    'RT/RW': [/rt\s*\/?\s*rw/i],
+    Kecamatan: [/kecamatan/i, /district/i],
+    Kelurahan: [/kelurahan/i, /village/i],
     'Nama Ibu Kandung': [/nama ibu/i, /mother/i],
+    'Jenis Kelamin': [/jenis kelamin/i, /gender/i],
+    'Status Pernikahan': [/status pernikahan/i, /status perkawinan/i, /marriage/i],
+    Pekerjaan: [/pekerjaan/i, /job/i],
+    Pendidikan: [/pendidikan/i, /graduate/i, /education/i],
   };
 
   const result: Record<string, string> = {};
@@ -495,50 +612,160 @@ async function readIdentityFields(page: Page): Promise<Record<string, string>> {
   result['Tempat Lahir'] ||= await readInputByPlaceholder(scope, [/tempat lahir/i]);
   result['Tanggal Lahir'] ||= await readInputByPlaceholder(scope, [/tanggal lahir/i]);
   result['Alamat sesuai KTP'] ||= await readInputByPlaceholder(scope, [/^alamat$/i]);
+  result['RT/RW'] = await readInputByPlaceholder(scope, [/rt\s*\/?\s*rw/i]) || result['RT/RW'] || '';
+  result.Kecamatan ||= await readSelectByLabel(scope, [/kecamatan/i, /district/i]);
+  result.Kelurahan ||= await readInputByPlaceholder(scope, [/kelurahan/i, /village/i]);
   result['Nama Ibu Kandung'] ||= await readInputByPlaceholder(scope, [/nama ibu/i]);
+  result['Jenis Kelamin'] ||= await readSelectByLabel(scope, [/jenis kelamin/i, /gender/i]);
+  result['Status Pernikahan'] ||= await readSelectByLabel(scope, [/status pernikahan/i, /status perkawinan/i, /marriage/i]);
+  result.Pekerjaan ||= await readSelectByLabel(scope, [/pekerjaan/i, /job/i]);
+  result.Pendidikan ||= await readSelectByLabel(scope, [/pendidikan/i, /graduate/i, /education/i]);
   return result;
 }
 
-async function readManifestRowMotherName(row: Locator): Promise<string> {
-  const motherTitle = row.getByText(/Nama Ibu/i).first();
-  if ((await motherTitle.count()) > 0 && (await motherTitle.isVisible().catch(() => false))) {
-    await motherTitle.click();
-    const motherInput = row.locator('input[placeholder*="Nama Ibu" i], textarea[placeholder*="Nama Ibu" i]').first();
-    const value = await motherInput.inputValue({ timeout: 3000 }).catch(() => '');
-    if (value.trim()) return value.trim();
+function mergeCurrentIdentity(document: DocumentReaderResult, fields: Record<string, string>): DocumentReaderResult {
+  return {
+    ...document,
+    name: fields['Nama Lengkap'] ?? fields.Name ?? fields.Nama ?? document.name,
+    nik: fields['NIK KTP'] ?? fields.NIK ?? document.nik,
+    birthPlace: fields['Tempat Lahir'] ?? document.birthPlace,
+    birthDate: fields['Tanggal Lahir'] ?? document.birthDate,
+    address: fields['Alamat sesuai KTP'] ?? fields.Alamat ?? document.address,
+    motherName: fields['Nama Ibu Kandung'] ?? document.motherName,
+    rawFields: {
+      ...document.rawFields,
+      ...fields,
+    },
+  };
+}
+
+async function fetchSystemFieldsFromApi(page: Page, record: SheetRecord): Promise<Record<string, string>> {
+  const token = await readWebsiteAuthTokenFromPage(page);
+  const url = new URL('/admin_api/invoices', config.WEBSITE_BASE_URL);
+  url.searchParams.set('per_page', '10');
+  url.searchParams.set('search[invoice_number]', normalizeInvoiceForSearch(record.invoiceNumber));
+  url.searchParams.set('include_profiles', '1');
+
+  const response = await page.request.get(url.toString(), {
+    headers: {
+      Accept: 'application/json',
+      Authorization: `Token token=${token}`,
+    },
+  });
+  const text = await response.text();
+  if (!response.ok()) throw new Error(`API ${url.pathname} returned HTTP ${response.status()}: ${text.slice(0, 300)}`);
+
+  const body = JSON.parse(text) as { data?: InvoiceApiItem[] };
+  const targetInvoice = normalizeInvoiceForSearch(record.invoiceNumber).toUpperCase();
+  const targetName = normalizeNameForComparison(record.firstManifestName);
+  const exactInvoices = (body.data ?? []).filter((item) => normalizeInvoiceForSearch(apiText(item.number)).toUpperCase() === targetInvoice);
+  const invoice = exactInvoices.find((item) => {
+    const profiles = [
+      ...(Array.isArray(item.profiles) ? item.profiles : []),
+      ...(Array.isArray(item.bookings) ? item.bookings.map((booking) => booking.profile).filter(Boolean) as ProfileApiItem[] : []),
+    ];
+    return profiles.some((profile) => {
+      const profileName = normalizeNameForComparison(apiText(profile.name));
+      return profileName === targetName || profileName.includes(targetName) || targetName.includes(profileName);
+    });
+  }) ?? exactInvoices[0];
+  if (!invoice) throw new Error(`Could not find invoice ${record.invoiceNumber} from API`);
+
+  const profiles = [
+    ...(Array.isArray(invoice.profiles) ? invoice.profiles : []),
+    ...(Array.isArray(invoice.bookings) ? invoice.bookings.map((booking) => booking.profile).filter(Boolean) as ProfileApiItem[] : []),
+  ];
+  const profile = profiles.find((item) => {
+    const profileName = normalizeNameForComparison(apiText(item.name));
+    return profileName === targetName || profileName.includes(targetName) || targetName.includes(profileName);
+  }) ?? (profiles.length === 1 ? profiles[0] : undefined);
+  if (!profile) throw new Error(`Could not find profile ${record.firstManifestName} from API invoice ${record.invoiceNumber}`);
+
+  const district = typeof profile.district === 'string' ? profile.district.trim() : apiText(profile.district?.name);
+  return {
+    'Nama Lengkap': apiText(profile.name),
+    'NIK KTP': apiText(profile.no_ktp),
+    'Tempat Lahir': apiText(profile.place_of_birth),
+    'Tanggal Lahir': apiDate(profile.date_of_birth),
+    'Alamat sesuai KTP': apiText(profile.address),
+    'RT/RW': '',
+    Kelurahan: apiText(profile.kelurahan),
+    Kecamatan: district,
+    'Nama Ibu Kandung': apiText(profile.mothers_name),
+    'Jenis Kelamin': normalizeGender(apiText(profile.gender)),
+    Pekerjaan: dropdownJobFromKtp(apiText(profile.job)),
+    'Status Pernikahan': normalizeMarriage(apiText(profile.marriage)),
+    Pendidikan: normalizeEducation(apiText(profile.education)),
+  };
+}
+
+async function readWebsiteAuthTokenFromPage(page: Page): Promise<string> {
+  const state = await page.context().storageState();
+  for (const origin of state.origins ?? []) {
+    const storage = origin.localStorage ?? [];
+    const directToken = storage.find((item) => item.name === 'auth_token' || item.name === 'jwt')?.value;
+    if (directToken) return directToken;
+
+    const credential = storage.find((item) => item.name === 'currentCredential')?.value;
+    if (!credential) continue;
+    const parsed = JSON.parse(credential) as { auth_token?: unknown; jwt?: unknown };
+    const token = typeof parsed.auth_token === 'string' ? parsed.auth_token : typeof parsed.jwt === 'string' ? parsed.jwt : '';
+    if (token) return token;
   }
 
-  return row.evaluate((element) => {
-    type VueLike = {
-      name?: string;
-      value?: unknown;
-      textValue?: unknown;
-      profileData?: { mothers_name?: unknown };
-      $props?: {
-        name?: string;
-        value?: unknown;
-        profileData?: { mothers_name?: unknown };
-      };
-    };
+  throw new Error('Could not read Website A auth token from authenticated browser session');
+}
 
-    const readValue = (value: unknown): string => (typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '');
-    const candidates = Array.from(element.querySelectorAll('*')) as Array<Element & { __vue__?: VueLike }>;
-    for (const candidate of candidates) {
-      const vm = candidate.__vue__;
-      if (!vm) continue;
+function apiDate(value: unknown): string {
+  const raw = apiText(value);
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (match) return `${match[3]}-${match[2]}-${match[1]}`;
+  return raw;
+}
 
-      const name = vm.$props?.name ?? vm.name;
-      if (name === 'mothers_name') {
-        return readValue(vm.$props?.value) || readValue(vm.value) || readValue(vm.textValue);
-      }
+function apiText(value: unknown): string {
+  return typeof value === 'string' || typeof value === 'number' ? String(value).trim() : '';
+}
 
-      const profileMother = vm.$props?.profileData?.mothers_name ?? vm.profileData?.mothers_name;
-      const profileMotherValue = readValue(profileMother);
-      if (profileMotherValue) return profileMotherValue;
+async function searchInvoice(page: Page, searchValue: string): Promise<void> {
+  const searchInput = page.locator('input[placeholder="Pencarian"]').first();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await searchInput.fill('');
+    await page.waitForTimeout(300);
+    await searchInput.fill(searchValue);
+    await page.keyboard.press('Enter').catch(() => undefined);
+    await page.waitForLoadState('networkidle').catch(() => undefined);
+    await page.waitForTimeout(1500);
+
+    const invoiceRows = await page.locator('tbody tr').filter({ hasText: /#?\s*TAB\s*-?\s*\d+/i }).count().catch(() => 0);
+    if (invoiceRows > 0) return;
+
+    const clearButton = page.getByRole('button', { name: /^clear$/i }).first();
+    if ((await clearButton.count()) > 0 && (await clearButton.isVisible().catch(() => false))) {
+      await clearButton.click().catch(() => undefined);
+      await page.waitForTimeout(500);
     }
+  }
+}
 
-    return '';
-  }).catch(() => '');
+async function findExactInvoiceLink(page: Page, searchValue: string): Promise<Locator> {
+  const links = page.locator('a:visible');
+  const count = await links.count();
+  const target = looseText(searchValue);
+
+  for (let index = 0; index < count; index += 1) {
+    const link = links.nth(index);
+    const text = await link.innerText().catch(() => '');
+    const candidate = looseText(text);
+    if (!candidate.includes('TAB')) continue;
+    if (candidate === target) return link;
+  }
+
+  throw new Error(`Could not find invoice link for ${searchValue}`);
+}
+
+function looseText(value: string): string {
+  return value.toUpperCase().replace(/[^A-Z0-9]+/g, '');
 }
 
 async function rowBelongsToInvoice(row: Locator, invoiceNumber: string): Promise<boolean> {
@@ -640,6 +867,22 @@ async function readInputByPlaceholder(scope: Locator, patterns: RegExp[]): Promi
   return '';
 }
 
+async function readSelectByLabel(scope: Locator, patterns: RegExp[]): Promise<string> {
+  for (const pattern of patterns) {
+    const formGroups = scope.locator('.form-group').filter({ hasText: pattern });
+    const count = await formGroups.count();
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const formGroup = formGroups.nth(index);
+      if (!(await formGroup.isVisible().catch(() => false))) continue;
+
+      const value = await formGroup.locator('.vs__selected').first().innerText({ timeout: 1000 }).catch(() => '');
+      if (value.trim()) return value.trim();
+    }
+  }
+
+  return '';
+}
+
 async function waitForDocumentReaderFields(page: Page, timeoutMs: number): Promise<void> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
@@ -652,12 +895,15 @@ async function waitForDocumentReaderFields(page: Page, timeoutMs: number): Promi
 }
 
 async function setIdentityField(page: Page, patterns: RegExp[], value: string): Promise<void> {
+  if (!value) return;
   const scope = await getVisibleFormScope(page);
   for (const pattern of patterns) {
     const formGroups = scope.locator('.form-group').filter({ hasText: pattern });
     const count = await formGroups.count();
     for (let index = count - 1; index >= 0; index -= 1) {
       const formGroup = formGroups.nth(index);
+      await formGroup.scrollIntoViewIfNeeded().catch(() => undefined);
+      await page.waitForTimeout(150);
       if (!(await formGroup.isVisible().catch(() => false))) continue;
 
       const input = formGroup.locator('input, textarea').first();
@@ -669,6 +915,371 @@ async function setIdentityField(page: Page, patterns: RegExp[], value: string): 
   }
 
   throw new Error('Could not find identity field');
+}
+
+async function setVueDateField(page: Page, patterns: RegExp[], value: string): Promise<void> {
+  if (!value) return;
+  const scope = await getVisibleFormScope(page);
+  for (const pattern of patterns) {
+    const formGroups = scope.locator('.form-group').filter({ hasText: pattern });
+    const count = await formGroups.count();
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const formGroup = formGroups.nth(index);
+      await formGroup.scrollIntoViewIfNeeded().catch(() => undefined);
+      await page.waitForTimeout(250);
+      if (!(await formGroup.isVisible().catch(() => false))) continue;
+
+      const input = formGroup.locator('input').first();
+      if ((await input.count()) > 0 && (await input.isVisible().catch(() => false))) {
+        await selectDateWithDatepicker(page, input, value);
+        return;
+      }
+    }
+  }
+
+  throw new Error('Could not find datepicker field');
+}
+
+async function selectDateWithDatepicker(page: Page, input: Locator, value: string): Promise<void> {
+  const target = parseDateParts(value);
+  if (!target) throw new Error(`Invalid date value for datepicker: ${value}`);
+
+  await input.click();
+  const popover = page.locator('.vc-popover-content:visible').last();
+  await popover.waitFor({ state: 'visible', timeout: 5000 });
+
+  await popover.locator('.vc-title').first().click();
+  const nav = page.locator('.vc-nav-container:visible').last();
+  await nav.waitFor({ state: 'visible', timeout: 5000 });
+
+  await openYearPicker(nav, target.year);
+  await clickYear(nav, target.year);
+  await clickMonth(nav, target.year, target.month);
+  await clickDay(popover, target.day);
+
+  await page.waitForTimeout(400);
+  await input.press('Tab').catch(() => undefined);
+}
+
+async function openYearPicker(nav: Locator, year: number): Promise<void> {
+  if ((await nav.locator(`.vc-nav-item[data-id="${year}"]:visible`).count().catch(() => 0)) > 0) return;
+  await nav.locator('.vc-nav-title').first().click();
+  await nav.locator('.vc-nav-item:visible').first().waitFor({ state: 'visible', timeout: 3000 });
+}
+
+async function clickYear(nav: Locator, year: number): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const yearItem = nav.locator(`.vc-nav-item[data-id="${year}"]:visible:not(.is-disabled)`).first();
+    if ((await yearItem.count().catch(() => 0)) > 0) {
+      await yearItem.click();
+      return;
+    }
+
+    const visibleYears = await nav.locator('.vc-nav-item:visible').evaluateAll((items) =>
+      items
+        .map((item) => Number(item.getAttribute('data-id') || item.textContent || ''))
+        .filter((item) => Number.isFinite(item)),
+    );
+    if (!visibleYears.length) break;
+
+    const minYear = Math.min(...visibleYears);
+    const maxYear = Math.max(...visibleYears);
+    const arrow = year < minYear ? '.vc-nav-arrow.is-left' : year > maxYear ? '.vc-nav-arrow.is-right' : '';
+    if (!arrow) break;
+    await nav.locator(arrow).first().click();
+    await nav.page().waitForTimeout(100);
+    await nav.locator('.vc-nav-item:visible').first().waitFor({ state: 'visible', timeout: 3000 });
+  }
+
+  throw new Error(`Could not select datepicker year ${year}`);
+}
+
+async function clickMonth(nav: Locator, year: number, month: number): Promise<void> {
+  const monthId = `${year}.${String(month).padStart(2, '0')}`;
+  const monthItem = nav.locator(`.vc-nav-item[data-id="${monthId}"]:visible:not(.is-disabled)`).first();
+  await monthItem.waitFor({ state: 'visible', timeout: 5000 });
+  await monthItem.click();
+}
+
+async function clickDay(popover: Locator, day: number): Promise<void> {
+  const dayItem = popover
+    .locator('.vc-day:not(.is-not-in-month) .vc-day-content:not(.is-disabled)')
+    .filter({ hasText: new RegExp(`^\\s*${day}\\s*$`) })
+    .first();
+  await dayItem.waitFor({ state: 'visible', timeout: 5000 });
+  await dayItem.click();
+}
+
+function parseDateParts(value: string): { day: number; month: number; year: number } | null {
+  const parts = value.match(/\d+/g)?.map(Number);
+  if (!parts || parts.length < 3) return null;
+
+  const [first, second, third] = parts;
+  const date =
+    String(first).length === 4
+      ? { year: first, month: second, day: third }
+      : { day: first, month: second, year: third };
+  if (date.year < 1900 || date.month < 1 || date.month > 12 || date.day < 1 || date.day > 31) return null;
+  return date;
+}
+
+async function setSelectField(page: Page, patterns: RegExp[], value: string, contextValues: string[] = []): Promise<void> {
+  if (!value) return;
+  const scope = await getVisibleFormScope(page);
+  for (const pattern of patterns) {
+    const formGroups = scope.locator('.form-group').filter({ hasText: pattern });
+    const count = await formGroups.count();
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const formGroup = formGroups.nth(index);
+      await formGroup.scrollIntoViewIfNeeded().catch(() => undefined);
+      await page.waitForTimeout(150);
+      if (!(await formGroup.isVisible().catch(() => false))) continue;
+
+      const search = formGroup.locator('.vs__search, input[type="search"]').first();
+      if ((await search.count()) === 0 || !(await search.isVisible().catch(() => false))) continue;
+
+      const selected = await chooseVisibleSelectOption(page, formGroup, value, contextValues);
+      if (!selected && contextValues.some((context) => context.trim())) {
+        console.log(`Skipping select field: could not find option for ${value} with context ${contextValues.filter(Boolean).join(', ')}`);
+      } else if (!selected) {
+        console.log(`Skipping select field: could not find option for ${value}`);
+      }
+      return;
+    }
+  }
+}
+
+async function chooseVisibleSelectOption(
+  page: Page,
+  formGroup: Locator,
+  value: string,
+  contextValues: string[] = [],
+): Promise<boolean> {
+  const search = formGroup.locator('.vs__search, input[type="search"]').first();
+  const context = contextValues.filter((item) => item.trim()).join(' ');
+  const queries = Array.from(new Set([
+    value,
+    [context, value].filter(Boolean).join(' '),
+  ].filter(Boolean)));
+
+  for (const query of queries) {
+    await search.click();
+    await search.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A').catch(() => undefined);
+    await search.press('Backspace').catch(() => undefined);
+    await search.type(query, { delay: 20 });
+    await page.waitForTimeout(1000);
+
+    const option = await findBestDropdownOption(page, value, contextValues);
+    if (!option) continue;
+
+    const optionText = (await option.innerText().catch(() => '')).trim();
+    await option.scrollIntoViewIfNeeded().catch(() => undefined);
+    await option.click();
+    await page.waitForTimeout(500);
+    await search.press('Tab').catch(() => undefined);
+
+    if (await selectedOptionMatches(formGroup, value, contextValues, optionText)) return true;
+  }
+
+  return false;
+}
+
+async function findBestDropdownOption(page: Page, value: string, contextValues: string[] = []): Promise<Locator | null> {
+  const deadline = Date.now() + 5000;
+  let best: Locator | null = null;
+  while (Date.now() < deadline) {
+    best = await findBestVisibleDropdownOption(page, value, contextValues);
+    if (best) return best;
+    await page.waitForTimeout(250);
+  }
+
+  return best;
+}
+
+async function findBestVisibleDropdownOption(page: Page, value: string, contextValues: string[] = []): Promise<Locator | null> {
+  const options = page.locator('.vs__dropdown-option:visible');
+  const count = await options.count();
+  const target = normalizePlaceForDropdown(value);
+  const contexts = contextValues.map(normalizePlaceForDropdown).filter(Boolean);
+  const targetTokens = target.split(' ').filter(Boolean);
+  let bestMatch: Locator | null = null;
+  let bestScore = 0;
+
+  for (let index = 0; index < count; index += 1) {
+    const option = options.nth(index);
+    const text = (await option.innerText().catch(() => '')).trim();
+    const normalizedText = normalizePlaceForDropdown(text);
+    if (!normalizedText) continue;
+    if (!contexts.length && targetTokens.length === 1 && normalizePlaceForDropdown(lastPlacePart(text)) !== target) continue;
+
+    const targetScore = scoreTokenMatch(normalizedText, target);
+    if (!targetScore) continue;
+
+    let score = targetScore;
+    for (const context of contexts) {
+      if (scoreTokenMatch(normalizedText, context)) score += 50;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = option;
+    }
+  }
+
+  return bestMatch;
+}
+
+async function selectedOptionMatches(
+  formGroup: Locator,
+  value: string,
+  contextValues: string[] = [],
+  optionText = '',
+): Promise<boolean> {
+  const selectedText = (await formGroup.locator('.vs__selected').first().innerText({ timeout: 2000 }).catch(() => '')).trim();
+  if (!selectedText) return false;
+
+  const text = normalizePlaceForDropdown(selectedText);
+  const clickedOption = normalizePlaceForDropdown(optionText);
+  if (clickedOption && text === clickedOption) return true;
+
+  const target = normalizePlaceForDropdown(value);
+  const targetTokens = target.split(' ').filter(Boolean);
+  if (!contextValues.some((context) => context.trim()) && targetTokens.length === 1) {
+    return normalizePlaceForDropdown(lastPlacePart(selectedText)) === target;
+  }
+
+  if (!scoreTokenMatch(text, target)) return false;
+
+  const contexts = contextValues.map(normalizePlaceForDropdown).filter(Boolean);
+  return contexts.every((context) => scoreTokenMatch(text, context));
+}
+
+function scoreTokenMatch(text: string, target: string): number {
+  if (!text || !target) return 0;
+  if (text === target) return 120;
+  const textTokens = text.split(' ').filter(Boolean);
+  const targetTokens = target.split(' ').filter(Boolean);
+  if (!targetTokens.length) return 0;
+
+  for (let index = 0; index <= textTokens.length - targetTokens.length; index += 1) {
+    if (targetTokens.every((token, tokenIndex) => textTokens[index + tokenIndex] === token)) return 100;
+  }
+
+  return 0;
+}
+
+function shouldSetText(current: string | undefined, target: string | undefined): boolean {
+  return Boolean(target?.trim()) && normalizeNameForComparison(current ?? '') !== normalizeNameForComparison(target ?? '');
+}
+
+function shouldSetDate(current: string | undefined, target: string | undefined): boolean {
+  const targetDigits = (target ?? '').replace(/\D/g, '');
+  if (!targetDigits) return false;
+  return (current ?? '').replace(/\D/g, '') !== targetDigits;
+}
+
+function shouldSetAddress(current: string | undefined, target: string | undefined): boolean {
+  if (!target?.trim()) return false;
+  return (current ?? '').trim().toUpperCase() !== target.trim().toUpperCase();
+}
+
+function shouldSetRtRw(current: string | undefined, target: string | undefined): boolean {
+  const targetDigits = (target ?? '').replace(/\D/g, '');
+  if (!targetDigits) return false;
+  return (current ?? '').replace(/\D/g, '') !== targetDigits;
+}
+
+function shouldSetDistrict(current: string | undefined, district: string | undefined, city: string | undefined): boolean {
+  const currentFull = normalizePlaceForDropdown(current ?? '');
+  const currentDistrict = normalizePlaceForDropdown(lastPlacePart(current ?? ''));
+  const districtNormalized = normalizePlaceForDropdown(district ?? '');
+  const cityNormalized = normalizePlaceForDropdown(city ?? '');
+  if (!districtNormalized) return false;
+  if (!scoreTokenMatch(currentDistrict, districtNormalized)) return true;
+  return Boolean(cityNormalized) && !scoreTokenMatch(currentFull, cityNormalized);
+}
+
+function lastPlacePart(value: string): string {
+  return value.split('-').map((part) => part.trim()).filter(Boolean).at(-1) ?? value;
+}
+
+function shouldSetDropdown(
+  current: string | undefined,
+  target: string | undefined,
+  normalize: (value: string | undefined) => string,
+): boolean {
+  if (!target?.trim()) return false;
+  const currentNormalized = normalizeNameForComparison(normalize(current));
+  const targetNormalized = normalizeNameForComparison(normalize(target));
+  return Boolean(targetNormalized) && currentNormalized !== targetNormalized;
+}
+
+function shouldSetJob(current: string | undefined, targetJob: string | undefined): boolean {
+  if (!targetJob?.trim()) return false;
+  return normalizeNameForComparison(dropdownJobFromKtp(current)) !== normalizeNameForComparison(targetJob);
+}
+
+function normalizePlaceForDropdown(value: string): string {
+  return normalizeNameForComparison(value)
+    .replace(/\b(KABUPATEN|KAB|KOTA|ADM|ADMINISTRASI)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normalizeGender(value: string | undefined): string {
+  const normalized = normalizeNameForComparison(value ?? '');
+  if (!normalized) return '';
+  if (normalized.includes('LAKI') || normalized === 'MALE') return 'Laki-laki';
+  if (normalized.includes('PEREMPUAN') || normalized === 'FEMALE') return 'Perempuan';
+  return value ?? '';
+}
+
+function normalizeMarriage(value: string | undefined): string {
+  const normalized = normalizeNameForComparison(value ?? '');
+  if (!normalized) return '';
+  if (normalized.includes('BELUM')) return 'Belum Menikah';
+  if (normalized.includes('KAWIN') || normalized.includes('MENIKAH')) return 'Menikah';
+  return 'Janda/Duda';
+}
+
+function normalizeJob(value: string | undefined): string {
+  return dropdownJobFromKtp(value);
+}
+
+function dropdownJobFromKtp(value: string | undefined): string {
+  const canonical = canonicalJob(value);
+  if (!canonical) return '';
+  if (canonical === 'IBU RUMAH TANGGA') return 'Ibu Rumah Tangga';
+  if (canonical === 'WIRAUSAHA') return 'WIRAUSAHA';
+  if (canonical === 'TIDAK BEKERJA') return 'BELUM/TIDAK BEKERJA';
+  if (['PNS', 'PEG. SWASTA', 'TNI/POLRI', 'PETANI', 'NELAYAN'].includes(canonical)) return canonical;
+  return 'LAINNYA';
+}
+
+function canonicalJob(value: string | undefined): string {
+  const normalized = (value ?? '').toUpperCase();
+  if (!normalized) return '';
+  if (normalized.includes('RUMAH TANGGA') || (normalized.includes('MENGURUS') && normalized.includes('TANGGA'))) return 'IBU RUMAH TANGGA';
+  if (normalized.includes('TIDAK') || normalized.includes('BELUM') || normalized.includes('PELAJAR') || normalized.includes('MAHASISWA')) return 'TIDAK BEKERJA';
+  if (normalized.includes('WIRASWASTA') || normalized.includes('WIRAUSAHA')) return 'WIRAUSAHA';
+  if (normalized.includes('SWASTA')) return 'PEG. SWASTA';
+  if (normalized.includes('TNI') || normalized.includes('POLRI')) return 'TNI/POLRI';
+  if (normalized.includes('PNS')) return 'PNS';
+  if (normalized.includes('PETANI')) return 'PETANI';
+  if (normalized.includes('NELAYAN')) return 'NELAYAN';
+  return normalized;
+}
+
+function normalizeEducation(value: string | undefined): string {
+  const normalized = normalizeNameForComparison(value ?? '');
+  if (!normalized) return '';
+  if (normalized.includes('SLTA') || normalized.includes('SMA')) return 'SMA/MA';
+  if (normalized.includes('SLTP') || normalized.includes('SMP')) return 'SMP/MTS';
+  if (normalized.includes('SD')) return 'SD/MI';
+  if (normalized.includes('S1') || normalized.includes('STRATAI')) return 'S1';
+  if (normalized.includes('S2')) return 'S2';
+  if (normalized.includes('S3')) return 'S3';
+  return value?.toUpperCase() ?? '';
 }
 
 async function storageStateIfExists(storageStatePath: string) {

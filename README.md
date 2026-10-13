@@ -210,6 +210,50 @@ When `INVOICE_NUMBER` is empty, the automation processes visible pending rows fr
 
 The automation does not log full NIK values. Temporary KTP and document files are removed at the end of each record where possible.
 
+## Fill BSI Form Links
+
+After adding these columns to the main sheet:
+
+- `form bsi pembukaan`
+- `form surat kuasa`
+
+Run:
+
+```bash
+npm run fill:bsi-links:dry-run
+npm run fill:bsi-links:dry-run:one
+npm run fill:bsi-links:one
+npm run fill:bsi-links
+```
+
+The script reads `Link TTD`, extracts the signature slug before `-signature`, then fills:
+
+- `form bsi pembukaan`: `https://arminarekacabang015.com/print/form-bsi-pembukaan-rek-jamaah/{slug}`
+- `form surat kuasa`: `https://arminarekacabang015.com/print/form-surat-kuasa/{slug}`
+
+Rows where both link columns already have values are skipped. Columns are found by header name, so inserted columns do not break the script.
+
+## Fill Agent Columns
+
+After adding these columns to the main sheet:
+
+- `Agen PJ`
+- `No HP Agen PJ`
+- `Stages`
+- `Agen Induk`
+- `No HP Agen Induk`
+
+Run:
+
+```bash
+npm run fill:agent-columns:dry-run
+npm run fill:agent-columns:dry-run:one
+npm run fill:agent-columns:one
+npm run fill:agent-columns
+```
+
+The script reads visible rows, looks up each invoice through Website A API, and fills empty agent columns from invoice/admin data. It uses the saved Website A session in `PLAYWRIGHT_STORAGE_STATE`.
+
 ## Verification
 
 The operator sees spreadsheet values, Document Reader values, and the AI result:

@@ -23,7 +23,28 @@ export interface DocumentReaderResult {
   motherName?: string;
   systemMotherName?: string;
   scannedMotherName?: string;
+  ktpVision?: KtpVisionResult;
   rawFields?: Record<string, string>;
+  systemFields?: Record<string, string>;
+  scannedFields?: Record<string, string>;
+}
+
+export interface KtpVisionResult {
+  name?: string;
+  nik?: string;
+  birthPlace?: string;
+  birthDate?: string;
+  address?: string;
+  rtRw?: string;
+  kelurahan?: string;
+  kecamatan?: string;
+  kabupatenKota?: string;
+  gender?: string;
+  job?: string;
+  marriageStatus?: string;
+  education?: string;
+  confidence?: 'HIGH' | 'MEDIUM' | 'LOW';
+  notes?: string;
 }
 
 export interface VerificationComparison {

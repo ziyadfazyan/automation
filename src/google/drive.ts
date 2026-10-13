@@ -24,14 +24,17 @@ export class DriveClient {
 
   async findExistingFolder(invoiceNumber: string, manifestName: string): Promise<DriveFolderMatch | null> {
     const folders = await this.listChildFolders();
-    const invoice = invoiceNumber.trim();
+    const invoice = normalizeInvoiceToken(invoiceNumber);
     const normalizedManifest = safeFolderNamePart(manifestName).toUpperCase();
+    const invoiceMatches = folders.filter((folder) => extractInvoiceTokens(folder.name).includes(invoice));
 
     return (
-      folders.find((folder) => {
+      invoiceMatches.find((folder) => {
         const upperName = folder.name.toUpperCase();
-        return upperName.includes(invoice.toUpperCase()) && upperName.includes(normalizedManifest);
-      }) ?? null
+        return upperName.includes(normalizedManifest);
+      }) ??
+      invoiceMatches[0] ??
+      null
     );
   }
 
@@ -118,4 +121,12 @@ export class DriveClient {
 
     return folders;
   }
+}
+
+function extractInvoiceTokens(value: string): string[] {
+  return Array.from(value.toUpperCase().matchAll(/#?\s*TAB\s*-?\s*\d+/g)).map((match) => normalizeInvoiceToken(match[0]));
+}
+
+function normalizeInvoiceToken(value: string): string {
+  return value.toUpperCase().replace(/[^A-Z0-9]+/g, '').replace(/^#/, '');
 }
