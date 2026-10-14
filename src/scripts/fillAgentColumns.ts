@@ -3,7 +3,9 @@ import { google } from 'googleapis';
 import { config } from '../config.js';
 import { createGoogleAuth } from '../google/auth.js';
 import { extractFirstManifestName, normalizeInvoiceForSearch, normalizeNameForComparison } from '../utils/normalize.js';
+import { resolveWebsiteSite } from '../utils/siteConfig.js';
 
+const SITE_HEADER = 'Site';
 const INVOICE_HEADER = 'Nomor Invoice';
 const MANIFEST_HEADER = 'Manifest';
 const AGENT_PJ_HEADER = 'Agen PJ';
@@ -52,6 +54,7 @@ async function fillAgentColumns(): Promise<void> {
 
   const headers = rows[0].values;
   const indexes = {
+    site: requireHeader(headers, SITE_HEADER),
     invoice: requireHeader(headers, INVOICE_HEADER),
     manifest: requireHeader(headers, MANIFEST_HEADER),
     agentPj: requireHeader(headers, AGENT_PJ_HEADER),
@@ -60,8 +63,8 @@ async function fillAgentColumns(): Promise<void> {
     parentAgent: requireHeader(headers, PARENT_AGENT_HEADER),
     parentAgentPhone: requireHeader(headers, PARENT_AGENT_PHONE_HEADER),
   };
-  const token = await readWebsiteAuthToken();
-  const adminById = await fetchAdmins(token);
+  const tokenCache = new Map<string, string>();
+  const adminCache = new Map<string, Map<number, AdminApiItem>>();
   const updates: Array<{ range: string; values: string[][] }> = [];
   let filled = 0;
   let skippedExisting = 0;
@@ -72,6 +75,7 @@ async function fillAgentColumns(): Promise<void> {
     if (limit && filled >= limit) break;
 
     const row = visibleRow.values;
+    const site = String(row[indexes.site] ?? '').trim();
     const invoiceNumber = String(row[indexes.invoice] ?? '').trim();
     const manifestName = extractFirstManifestName(String(row[indexes.manifest] ?? ''));
     if (!invoiceNumber) {
@@ -92,13 +96,25 @@ async function fillAgentColumns(): Promise<void> {
       continue;
     }
 
-    const invoice = await fetchInvoice(token, invoiceNumber, manifestName);
+    const siteConfig = resolveWebsiteSite(site);
+    let token = tokenCache.get(siteConfig.key);
+    if (!token) {
+      token = await readWebsiteAuthToken(site);
+      tokenCache.set(siteConfig.key, token);
+    }
+
+    const invoice = await fetchInvoice(token, site, invoiceNumber, manifestName);
     if (!invoice?.admin) {
       skippedNotFound += 1;
       console.log(`Skipped row ${visibleRow.rowNumber}: invoice/admin not found for ${invoiceNumber} ${manifestName}`);
       continue;
     }
 
+    let adminById = adminCache.get(siteConfig.key);
+    if (!adminById) {
+      adminById = await fetchAdmins(token, site);
+      adminCache.set(siteConfig.key, adminById);
+    }
     const agent = invoice.admin;
     const cachedAgent = agent.id ? adminById.get(Number(agent.id)) : undefined;
     const parentId = Number(cachedAgent?.parent_id ?? agent.parent_id ?? agent.parent?.id ?? 0);
@@ -152,8 +168,9 @@ async function fillAgentColumns(): Promise<void> {
   console.log(`Skipped ${skippedNotFound} row(s) where API data was not found.`);
 }
 
-async function fetchInvoice(token: string, invoiceNumber: string, manifestName: string): Promise<InvoiceApiItem | null> {
-  const url = new URL('/admin_api/invoices', config.WEBSITE_BASE_URL);
+async function fetchInvoice(token: string, siteValue: string, invoiceNumber: string, manifestName: string): Promise<InvoiceApiItem | null> {
+  const site = resolveWebsiteSite(siteValue);
+  const url = new URL('/admin_api/invoices', site.baseUrl);
   url.searchParams.set('per_page', '10');
   url.searchParams.set('search[invoice_number]', normalizeInvoiceForSearch(invoiceNumber));
   url.searchParams.set('include_profiles', '1');
@@ -167,13 +184,14 @@ async function fetchInvoice(token: string, invoiceNumber: string, manifestName: 
   ) ?? matches[0] ?? null;
 }
 
-async function fetchAdmins(token: string): Promise<Map<number, AdminApiItem>> {
+async function fetchAdmins(token: string, siteValue: string): Promise<Map<number, AdminApiItem>> {
   const result = new Map<number, AdminApiItem>();
+  const site = resolveWebsiteSite(siteValue);
   let page = 1;
   let totalPage = 1;
 
   do {
-    const url = new URL('/admin_api/admins', config.WEBSITE_BASE_URL);
+    const url = new URL('/admin_api/admins', site.baseUrl);
     url.searchParams.set('page', String(page));
     url.searchParams.set('per_page', '200');
     const body = await fetchJson<{ data?: AdminApiItem[]; meta?: { total_page?: number } }>(url, token);
@@ -199,17 +217,20 @@ async function fetchJson<T>(url: URL, token: string): Promise<T> {
   return JSON.parse(text) as T;
 }
 
-async function readWebsiteAuthToken(): Promise<string> {
-  const raw = await fs.readFile(config.PLAYWRIGHT_STORAGE_STATE, 'utf8');
-  const state = JSON.parse(raw) as { origins?: Array<{ localStorage?: Array<{ name?: string; value?: string }> }> };
+async function readWebsiteAuthToken(siteValue: string): Promise<string> {
+  const site = resolveWebsiteSite(siteValue);
+  const storagePath = config.PLAYWRIGHT_STORAGE_STATE;
+  const raw = await fs.readFile(storagePath, 'utf8');
+  const state = JSON.parse(raw) as { origins?: Array<{ origin?: string; localStorage?: Array<{ name?: string; value?: string }> }> };
   for (const origin of state.origins ?? []) {
+    if (origin.origin && new URL(origin.origin).origin !== new URL(site.baseUrl).origin) continue;
     const credential = origin.localStorage?.find((item) => item.name === 'currentCredential')?.value;
     if (!credential) continue;
     const parsed = JSON.parse(credential) as { auth_token?: unknown; jwt?: unknown };
     const token = typeof parsed.auth_token === 'string' ? parsed.auth_token : typeof parsed.jwt === 'string' ? parsed.jwt : '';
     if (token) return token;
   }
-  throw new Error(`Could not read Website A auth token from ${config.PLAYWRIGHT_STORAGE_STATE}. Run npm run auth:website first.`);
+  throw new Error(`Could not read Website auth token from ${storagePath}. Run SITE=${site.key} npm run auth:website first.`);
 }
 
 async function getVisibleRows(): Promise<VisibleRow[]> {

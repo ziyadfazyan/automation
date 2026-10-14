@@ -5,6 +5,7 @@ import { extractFirstManifestName, normalizeInvoiceForSearch } from '../utils/no
 import { createGoogleAuth } from './auth.js';
 
 const REQUIRED_COLUMNS = [
+  'Site',
   'Nomor Invoice',
   'Manifest',
   'Nama Lengkap',
@@ -180,6 +181,7 @@ export class SheetsClient {
     const manifest = value('Manifest');
     return {
       rowNumber,
+      site: value('Site'),
       invoiceNumber: value('Nomor Invoice'),
       manifest,
       firstManifestName: extractFirstManifestName(manifest),

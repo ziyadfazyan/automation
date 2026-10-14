@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { DocumentReaderResult, SheetRecord } from '../types/record.js';
 import { WorkflowError } from '../types/status.js';
 import { normalizeInvoiceForSearch, normalizeNameForComparison } from '../utils/normalize.js';
+import { resolveWebsiteSite, WebsiteSiteConfig } from '../utils/siteConfig.js';
 
 export interface SiteAutomationResult {
   documentReaderResult: DocumentReaderResult;
@@ -42,10 +43,12 @@ interface ProfileApiItem {
 export class SiteAutomation {
   private context: BrowserContext | null = null;
   private page: Page | null = null;
+  private siteConfig: WebsiteSiteConfig = resolveWebsiteSite();
   private selectedManifestName: string | null = null;
   private selectedInvoiceNumber: string | null = null;
 
-  async initialize(): Promise<void> {
+  async initialize(site?: string): Promise<void> {
+    this.siteConfig = resolveWebsiteSite(site);
     await fs.mkdir(path.dirname(config.PLAYWRIGHT_STORAGE_STATE), { recursive: true });
     try {
       const browser = await chromium.launch({ headless: config.PLAYWRIGHT_HEADLESS, slowMo: 50 });
@@ -66,7 +69,7 @@ export class SiteAutomation {
 
   async saveAuthenticatedState(): Promise<void> {
     const page = this.requirePage();
-    await page.goto(config.WEBSITE_INVOICES_URL, { waitUntil: 'domcontentloaded' });
+    await page.goto(this.siteConfig.invoicesUrl, { waitUntil: 'domcontentloaded' });
     console.log('Log in manually if prompted. Press Enter here after Website A is authenticated.');
     await waitForEnter();
     await this.context?.storageState({ path: config.PLAYWRIGHT_STORAGE_STATE });
@@ -259,7 +262,7 @@ export class SiteAutomation {
   }
 
   private async openInvoice(page: Page, invoiceNumber: string): Promise<string> {
-    await page.goto(config.WEBSITE_INVOICES_URL, { waitUntil: 'domcontentloaded' });
+    await page.goto(this.siteConfig.invoicesUrl, { waitUntil: 'domcontentloaded' });
     const searchValue = normalizeInvoiceForSearch(invoiceNumber);
     await searchInvoice(page, searchValue);
 
@@ -272,7 +275,7 @@ export class SiteAutomation {
     await page.waitForTimeout(750);
 
     if (!page.url().includes('/invoices/') && href) {
-      await page.goto(resolveWebsiteHref(href), { waitUntil: 'domcontentloaded' });
+      await page.goto(resolveWebsiteHref(href, this.siteConfig.baseUrl), { waitUntil: 'domcontentloaded' });
       await page.waitForTimeout(750);
     }
 
@@ -301,7 +304,7 @@ export class SiteAutomation {
     const safeInvoice = invoiceNumber.replace(/[^\w.-]+/g, '_');
     const safeName = displayName.replace(/[^\w.-]+/g, '_');
 
-    const pengajuanUrl = new URL(`/print/pengajuan-rekening-jamaah/${invoiceSlug}`, config.WEBSITE_BASE_URL).toString();
+    const pengajuanUrl = new URL(`/print/pengajuan-rekening-jamaah/${invoiceSlug}`, this.siteConfig.baseUrl).toString();
     const pengajuan = await this.downloadUrl(
       page,
       pengajuanUrl,
@@ -318,7 +321,7 @@ export class SiteAutomation {
     }
     const signer = await this.downloadUrl(
       page,
-      new URL(signerHref, config.WEBSITE_BASE_URL).toString(),
+      new URL(signerHref, this.siteConfig.baseUrl).toString(),
       `Signature ${safeName} ${safeInvoice}`,
       'artifacts/documents',
     );
@@ -330,7 +333,7 @@ export class SiteAutomation {
       if (parafHref && !parafHref.includes('image-not-found')) {
         documents.push(await this.downloadUrl(
           page,
-          new URL(parafHref, config.WEBSITE_BASE_URL).toString(),
+          new URL(parafHref, this.siteConfig.baseUrl).toString(),
           `Paraf ${safeName} ${safeInvoice}`,
           'artifacts/documents',
         ));
@@ -457,7 +460,7 @@ export class SiteAutomation {
     if ((await ktpLink.count()) > 0) {
       const href = await ktpLink.getAttribute('href', { timeout: 2000 }).catch(() => null);
       if (href) {
-        const response = await page.request.get(new URL(href, config.WEBSITE_BASE_URL).toString());
+        const response = await page.request.get(new URL(href, this.siteConfig.baseUrl).toString());
         if (!response.ok()) {
           throw new WorkflowError('KTP download request failed', 'DOWNLOAD_FAILED', 'DOWNLOAD_KTP');
         }
@@ -475,7 +478,7 @@ export class SiteAutomation {
       throw new WorkflowError('Could not find KTP image/link', 'DOWNLOAD_FAILED', 'DOWNLOAD_KTP');
     }
 
-    const response = await page.request.get(new URL(src, config.WEBSITE_BASE_URL).toString());
+    const response = await page.request.get(new URL(src, this.siteConfig.baseUrl).toString());
     if (!response.ok()) {
       throw new WorkflowError('KTP image download failed', 'DOWNLOAD_FAILED', 'DOWNLOAD_KTP');
     }
@@ -641,7 +644,8 @@ function mergeCurrentIdentity(document: DocumentReaderResult, fields: Record<str
 
 async function fetchSystemFieldsFromApi(page: Page, record: SheetRecord): Promise<Record<string, string>> {
   const token = await readWebsiteAuthTokenFromPage(page);
-  const url = new URL('/admin_api/invoices', config.WEBSITE_BASE_URL);
+  const site = resolveWebsiteSite(record.site);
+  const url = new URL('/admin_api/invoices', site.baseUrl);
   url.searchParams.set('per_page', '10');
   url.searchParams.set('search[invoice_number]', normalizeInvoiceForSearch(record.invoiceNumber));
   url.searchParams.set('include_profiles', '1');
@@ -1311,10 +1315,10 @@ function extractInvoiceSlug(invoiceUrl: string): string {
   return match?.[1] ?? '';
 }
 
-function resolveWebsiteHref(href: string): string {
+function resolveWebsiteHref(href: string, baseUrl: string): string {
   if (href.startsWith('http')) return href;
-  if (href.startsWith('#')) return `${config.WEBSITE_BASE_URL}/app_v2/${href}`;
-  return new URL(href, config.WEBSITE_BASE_URL).toString();
+  if (href.startsWith('#')) return `${baseUrl}/app_v2/${href}`;
+  return new URL(href, baseUrl).toString();
 }
 
 function extensionForContentType(contentType: string, url: string): string {

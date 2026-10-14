@@ -13,6 +13,8 @@
     "fill:bsi-links:dry-run": "node --import tsx src/scripts/fillBsiLinks.ts --dry-run",
     "fill:bsi-links:one": "node --import tsx src/scripts/fillBsiLinks.ts --limit=1",
     "fill:bsi-links:dry-run:one": "node --import tsx src/scripts/fillBsiLinks.ts --dry-run --limit=1",
+    "fill:bsi-links:overwrite": "node --import tsx src/scripts/fillBsiLinks.ts --overwrite",
+    "fill:bsi-links:overwrite:dry-run": "node --import tsx src/scripts/fillBsiLinks.ts --overwrite --dry-run",
     "fill:agent-columns": "node --import tsx src/scripts/fillAgentColumns.ts",
     "fill:agent-columns:dry-run": "node --import tsx src/scripts/fillAgentColumns.ts --dry-run",
     "fill:agent-columns:one": "node --import tsx src/scripts/fillAgentColumns.ts --limit=1",

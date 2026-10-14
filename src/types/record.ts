@@ -1,5 +1,6 @@
 export interface SheetRecord {
   rowNumber: number;
+  site: string;
   invoiceNumber: string;
   manifest: string;
   firstManifestName: string;

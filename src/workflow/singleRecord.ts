@@ -10,6 +10,7 @@ import { DriveClient } from '../google/drive.js';
 import { SheetsClient } from '../google/sheets.js';
 import { DocumentReaderResult, SheetRecord, VerificationResult } from '../types/record.js';
 import { WorkflowError } from '../types/status.js';
+import { resolveWebsiteSite } from '../utils/siteConfig.js';
 
 export async function runSingleRecord(): Promise<void> {
   const sheets = new SheetsClient();
@@ -18,7 +19,7 @@ export async function runSingleRecord(): Promise<void> {
 
   let record: SheetRecord | null = null;
   let processedCount = 0;
-  let siteInitialized = false;
+  let activeSiteKey: string | null = null;
 
   try {
     do {
@@ -34,9 +35,11 @@ export async function runSingleRecord(): Promise<void> {
 
         console.log(`Selected invoice ${record.invoiceNumber} for ${record.firstManifestName}.`);
 
-        if (!siteInitialized) {
-          await site.initialize();
-          siteInitialized = true;
+        const recordSiteKey = resolveWebsiteSite(record.site).key;
+        if (activeSiteKey !== recordSiteKey) {
+          if (activeSiteKey) await site.close().catch(() => undefined);
+          await site.initialize(record.site);
+          activeSiteKey = recordSiteKey;
         }
 
         const result = await site.processToVerification(record);
@@ -235,9 +238,9 @@ function mergeDocumentResult(base: DocumentReaderResult, current: DocumentReader
 export async function saveWebsiteAuth(): Promise<void> {
   const site = new SiteAutomation();
   try {
-    await site.initialize();
+    await site.initialize(config.SITE);
     await site.saveAuthenticatedState();
-    console.log(`Saved Website A session to ${config.PLAYWRIGHT_STORAGE_STATE}.`);
+    console.log('Saved Website session.');
   } finally {
     await site.close().catch(() => undefined);
   }

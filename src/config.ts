@@ -18,6 +18,7 @@ const envSchema = z.object({
   OPENAI_BASE_URL: z.string().url().optional(),
   OPENAI_MODEL: z.string().default('gpt-4o-mini'),
   INVOICE_NUMBER: z.string().optional(),
+  SITE: z.string().optional(),
 });
 
 export const config = envSchema.parse(process.env);
